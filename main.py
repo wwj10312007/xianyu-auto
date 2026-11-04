@@ -13,6 +13,11 @@ import re
 
 import media
 import notifier
+from reply_rules import (
+    ScriptBook, attach_seller_id, build_handoff_notice, classify_role,
+    explain_seller_fields, explain_stuck, guard_ordered_reply, looks_uncertain,
+    should_skip_as_buyer, suggest_replies, summarize_chat,
+)
 from store import Store
 from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, generate_device_id, decrypt
 from XianyuAgent import XianyuReplyBot
@@ -126,6 +131,11 @@ class XianyuLive:
         db_path = os.path.join(self.account_dir, 'data', 'chat_history.db')
         self.context_manager = ChatContextManager(db_path=db_path)
         self.store = Store(db_path)
+        # 机主回过的话，各账号共用这一本，下次同类问题优先用
+        self.scripts = ScriptBook(os.path.join(BASE_DIR, 'data', 'learned_scripts.db'))
+        self._my_items_cache = None
+        self._my_items_at = 0
+        self._item_fetch_fail = {}
         self.fail_streak = 0                     # 连续连接失败次数，到 5 次通知机主
         self.auto_price = os.getenv("AUTO_PRICE", "True").lower() == "true"
         self.min_price_ratio = float(os.getenv("AUTO_PRICE_MIN_RATIO", "0.7"))   # 成交价不能低于标价的这个比例
@@ -591,9 +601,10 @@ class XianyuLive:
                         logger.info(f"🟢 已恢复会话 {chat_id} 的自动回复 (商品: {item_id})")
                     return
                 
-                # 记录卖家人工回复
+                # 记录卖家人工回复，并把他刚说的话记成话术
                 self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", send_message)
                 logger.info(f"卖家人工回复 (会话: {chat_id}, 商品: {item_id}): {send_message}")
+                self.remember_owner_reply(chat_id, item_id, send_message)
                 return
             
             logger.info(f"用户: {send_user_name} (ID: {send_user_id}), 商品: {item_id}, 会话: {chat_id}, 消息: {send_message}")
@@ -602,6 +613,17 @@ class XianyuLive:
             if send_user_id in own_user_ids():
                 logger.info("发信人是本机另一个号，跳过")
                 return
+
+            # 先分清这个号是不是商品的卖家。真正的买家侧不认领这条消息，免得占掉卖家号的回复。
+            item_info = self.load_item_info(item_id)
+            role, why = await self.seller_role(item_id, item_info)
+            if should_skip_as_buyer(role):
+                logger.info(f"当前账号在会话商品 {item_id} 中是买家（依据：{why}），跳过自动回复")
+                return
+            if role == 'unknown':
+                logger.warning(f"当前账号在会话商品 {item_id} 中卖家身份未确认（依据：{why}）。不能当成买家跳过，继续自动回复")
+            else:
+                logger.info(f"当前账号在会话商品 {item_id} 中是卖家（依据：{why}）")
 
             # 同一条消息只处理一次（多个号同时收到 / 重连重放）
             if not claim_message(chat_id, send_user_id, create_time, send_message):
@@ -626,20 +648,9 @@ class XianyuLive:
                 self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
                 logger.info(f"[收尾话不回] {send_message}")
                 return
-            # 从数据库中获取商品信息，如果不存在则从API获取并保存
-            item_info = self.context_manager.get_item_info(item_id)
             if not item_info:
-                logger.info(f"从API获取商品信息: {item_id}")
-                api_result = self.xianyu.get_item_info(item_id)
-                if 'data' in api_result and 'itemDO' in api_result['data']:
-                    item_info = api_result['data']['itemDO']
-                    # 保存商品信息到数据库
-                    self.context_manager.save_item_info(item_id, item_info)
-                else:
-                    logger.warning(f"获取商品信息失败: {api_result}")
-                    return
-            else:
-                logger.info(f"从数据库获取商品信息: {item_id}")
+                logger.warning(f"商品 {item_id} 详情没拿到，仍继续回复，避免本店咨询被丢掉")
+                item_info = {}
 
             # 每次准备回复前查询该买家是否已经拍下这个商品，发货时间要按订单状态回答。
             buyer_has_order = None
@@ -658,7 +669,7 @@ class XianyuLive:
             # 买家要购买记录 / 实物素材：按商品文件夹自动发
             if media.wants_media(send_message):
                 self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
-                await self.handle_media_request(websocket, chat_id, send_user_id, send_user_name, item_id, send_message)
+                await self.handle_media_request(websocket, chat_id, send_user_id, send_user_name, item_id, send_message, buyer_has_order, item_info)
                 return
 
             # 发货时间按是否已有订单固定回答，避免模型把未拍下和已拍下的情况混在一起。
@@ -668,10 +679,24 @@ class XianyuLive:
                 await self.reply_text(websocket, chat_id, send_user_id, shipping_reply, item_id)
                 return
 
+            # 机主以前答过同类问题：直接用他的原话，不再让模型现编
+            learned = self.scripts.find(send_message, item_id)
+            if learned:
+                learned_reply, dropped = guard_ordered_reply(learned['reply'], buyer_has_order)
+                if dropped:
+                    logger.info(f"买家已拍下，话术里的催拍已去掉：{dropped}")
+                logger.info(f"命中机主话术（以前的问法「{learned['question']}」）：{learned_reply}")
+                self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
+                await self.reply_text(websocket, chat_id, send_user_id, learned_reply, item_id)
+                return
+
             # 买家点名要人工 / 退款投诉：直接转给机主
             if any(w in send_message for w in HANDOFF_WORDS):
                 self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
-                await self.handoff(websocket, chat_id, send_user_id, send_user_name, item_id, send_message, "买家点名要人工或提到退款 / 投诉")
+                await self.handoff(
+                    websocket, chat_id, send_user_id, send_user_name, item_id, send_message,
+                    "买家点名要人工，或提到退款 / 投诉，需要你亲自处理",
+                    item_info=item_info, buyer_has_order=buyer_has_order)
                 return
 
             # 获取完整的对话上下文
@@ -681,19 +706,31 @@ class XianyuLive:
                 self.bot.generate_reply,
                 send_message,
                 item_description,
-                context=context
+                context,
+                buyer_has_order,
             )
 
-            # 机器人自己判断答不了：转给机主
-            if "转人工" in bot_reply:
+            # 拿不准、没写出内容、或模型标了转人工：不要把猜测发给买家
+            if not (bot_reply or '').strip() or looks_uncertain(bot_reply):
                 self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
-                await self.handoff(websocket, chat_id, send_user_id, send_user_name, item_id, send_message, "机器人判断自己答不了")
+                stuck = "模型判断自己答不了，硬答容易编"
+                if (bot_reply or '').strip() and "转人工" not in bot_reply:
+                    stuck = f"回复像在猜（「{(bot_reply or '')[:40]}」），已拦住不发给买家"
+                elif not (bot_reply or '').strip():
+                    stuck = "模型没有给出回复，不能空着发，也不能现编"
+                await self.handoff(
+                    websocket, chat_id, send_user_id, send_user_name, item_id, send_message, stuck,
+                    item_info=item_info, buyer_has_order=buyer_has_order)
                 return
             
             # 检查是否需要回复
             if bot_reply == "-":
                 logger.info(f"[无需回复] 用户 {send_user_name} 的消息被识别为无需回复类型")
                 return
+
+            bot_reply, dropped = guard_ordered_reply(bot_reply, buyer_has_order)
+            if dropped:
+                logger.info(f"买家已拍下商品 {item_id}，拦下催拍话 {dropped}，发出：{bot_reply}")
             
             # 添加用户消息到上下文
             self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
@@ -703,11 +740,6 @@ class XianyuLive:
                 self.context_manager.increment_bargain_count_by_chat(chat_id)
                 bargain_count = self.context_manager.get_bargain_count_by_chat(chat_id)
                 logger.info(f"用户 {send_user_name} 对商品 {item_id} 的议价次数: {bargain_count}")
-            
-            # STRIP_PUNCT 去掉回复里的标点（保留数字间的小数点）
-            import re as _re
-            bot_reply = _re.sub(r'(?<!\d)[^\w\s]|[^\w\s](?!\d)', ' ', bot_reply)
-            bot_reply = _re.sub(r'[ \t]+', ' ', bot_reply).strip()
 
             # 添加机器人回复到上下文
             self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", bot_reply)
@@ -793,10 +825,13 @@ class XianyuLive:
             await asyncio.sleep(random.uniform(1.0, 2.5))
         self.store.media_sent(chat_id, item_id)
 
-    async def handle_media_request(self, ws, chat_id, buyer_id, buyer_name, item_id, text):
+    async def handle_media_request(self, ws, chat_id, buyer_id, buyer_name, item_id, text, buyer_has_order=None, item_info=None):
         folder = media.item_folder(item_id)
         imgs, vids = media.list_media(folder) if folder else ([], [])
-        has_order = (not self.media_require_order) or await self.has_order(buyer_id, item_id)
+        if buyer_has_order is True:
+            has_order = True
+        else:
+            has_order = (not self.media_require_order) or await self.has_order(buyer_id, item_id)
         if not has_order:
             # 没拍下：直接回拍下后发，不拖；素材文件夹还空着就顺手提醒机主（不暂停会话）
             self.store.want_media(chat_id, buyer_id, item_id)
@@ -806,8 +841,9 @@ class XianyuLive:
             return
         if not imgs and not vids:
             await self.handoff(ws, chat_id, buyer_id, buyer_name, item_id, text,
-                               f"买家要购买记录 / 实物素材，但「素材\\{os.path.basename(folder or str(item_id))}」文件夹里还没放文件，放进去以后这个商品的买家就自动收到、不再提醒",
-                               key=f"media_empty:{self.account}:{item_id}", cooldown=86400)
+                               f"买家要购买记录 / 实物素材，但「素材\\{os.path.basename(folder or str(item_id))}」文件夹里还没放文件",
+                               key=f"media_empty:{self.account}:{item_id}", cooldown=86400,
+                               item_info=item_info, buyer_has_order=buyer_has_order)
             return
         if self.store.media_already_sent(chat_id, item_id):
             logger.info(f"商品 {item_id} 的素材已经发过给会话 {chat_id}，不重复发")
@@ -830,17 +866,111 @@ class XianyuLive:
         self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", text)
         await self.send_msg(ws, chat_id, buyer_id, text)
 
+    def load_item_info(self, item_id):
+        """读商品详情，并把卖家 id 一并存上。卖家 id 在 sellerDO，不在 itemDO 里。"""
+        cached = self.context_manager.get_item_info(item_id)
+        if cached and (explain_seller_fields(cached)[0] or cached.get('_seller_checked')):
+            logger.info(f"从数据库获取商品信息: {item_id}")
+            return cached
+        if time.time() - self._item_fetch_fail.get(str(item_id), 0) < 300:
+            logger.info(f"商品 {item_id} 详情刚才没拉到，5 分钟内不再反复请求")
+            return cached
+        logger.info(f"从API获取商品信息: {item_id}" + ("（缓存里没有可用卖家ID，重新拉）" if cached else ""))
+        try:
+            api_result = self.xianyu.get_item_info(item_id)
+        except Exception as e:
+            logger.warning(f"获取商品信息失败 {item_id}：{e!r}")
+            self._item_fetch_fail[str(item_id)] = time.time()
+            return cached
+        data = (api_result or {}).get('data') if isinstance(api_result, dict) else None
+        item_do = (data or {}).get('itemDO') if isinstance(data, dict) else None
+        if not item_do:
+            logger.warning(f"获取商品信息失败: {api_result}")
+            self._item_fetch_fail[str(item_id)] = time.time()
+            return cached
+        item = attach_seller_id(item_do, data)
+        sid, rejected = explain_seller_fields(item)
+        if sid:
+            logger.info(f"商品 {item_id} 卖家ID {sid}")
+        else:
+            logger.warning(f"商品 {item_id} 详情里没有完整卖家ID，丢弃的字段：{rejected or '无'}")
+        self.context_manager.save_item_info(item_id, item)
+        return item
+
+    async def _my_item_index(self):
+        """账号主页商品 id。拉失败返回 None，不能当成空列表（空列表会被误当成「都不是我的」）。"""
+        now = time.time()
+        if self._my_items_cache is not None and now - self._my_items_at < 600:
+            ids, note = self._my_items_cache
+            return ids, note + '（10分钟内的缓存）'
+        try:
+            items = await asyncio.to_thread(self.xianyu.list_my_items)
+        except Exception as e:
+            logger.warning(f"拉账号商品列表失败，不能用列表判断是不是买家：{e!r}")
+            return None
+        ids = {str(it['item_id']) for it in items}
+        ids |= {str(x) for x in getattr(self.xianyu, 'last_item_id_aliases', set())}
+        note = getattr(self.xianyu, 'last_item_list_note', f'拉到 {len(items)} 个')
+        self._my_items_cache = (ids, note)
+        self._my_items_at = now
+        return ids, note
+
+    async def seller_role(self, item_id, item_info):
+        """本号在这个会话商品上是卖家、买家，还是还不能确定。"""
+        sid, rejected = explain_seller_fields(item_info or {})
+        in_list = None
+        list_note = ''
+        if not sid:
+            index = await self._my_item_index()
+            if index is None:
+                list_note = '商品列表没拉到'
+            else:
+                ids, list_note = index
+                in_list = str(item_id) in ids
+        role, why = classify_role(self.myid, sid, in_list)
+        if not sid and rejected:
+            why += f"。详情里这些字段不能当卖家ID：{rejected}"
+        if list_note and not sid:
+            why += f"。列表情况：{list_note}"
+        return role, why
+
+    def remember_owner_reply(self, chat_id, item_id, owner_text):
+        """人工接管时，机主怎么回，就记成以后同类问题的话术。"""
+        text = (owner_text or '').strip()
+        if not text or self.check_toggle_keywords(text) or is_closing(text) or text in STALL_REPLIES:
+            return
+        if not self.is_manual_mode(chat_id):
+            return
+        question = ''
+        for msg in reversed(self.context_manager.get_context_by_chat(chat_id)):
+            if msg.get('role') == 'user':
+                question = msg.get('content') or ''
+                break
+        if not question or is_closing(question):
+            logger.info("人工回复没有对应的买家问题，不记话术")
+            return
+        saved = self.scripts.learn(question, text, item_id=item_id, account=self.account)
+        if saved:
+            logger.info(f"记下话术（{saved}）：问「{question}」→「{text}」")
+
     # ---------- 转人工 ----------
-    async def handoff(self, ws, chat_id, buyer_id, buyer_name, item_id, text, reason, key=None, cooldown=600):
-        """机器人答不了：先稳住买家，暂停这个会话的自动回复，微信 / 电脑通知机主来回"""
+    async def handoff(self, ws, chat_id, buyer_id, buyer_name, item_id, text, reason, key=None, cooldown=600,
+                      item_info=None, buyer_has_order=None):
+        """拿不准就交给机主：稳住买家，暂停这个会话，通知里写清原话、卡在哪、两条可复制的回复。"""
         self.enter_manual_mode(chat_id)
-        logger.info(f"🔴 转人工：{buyer_name}（{buyer_id}）商品 {item_id}：{text}（{reason}）")
+        info = item_info if isinstance(item_info, dict) else (self.context_manager.get_item_info(item_id) or {})
+        title = info.get('title') or ''
+        desc = info.get('desc') or ''
+        stuck = explain_stuck(text, reason, f"{title}\n{desc}")
+        drafts = suggest_replies(text, title, desc, has_order=buyer_has_order)
+        points = summarize_chat(self.context_manager.get_context_by_chat(chat_id))
+        notice_title, notice_body = build_handoff_notice(
+            self.account, buyer_name, item_id, title, text, stuck, points, drafts)
+        logger.info(f"🔴 转人工：{buyer_name}（{buyer_id}）商品 {item_id}\n{notice_body}")
         await self.reply_text(ws, chat_id, buyer_id, random.choice(STALL_REPLIES), item_id)
         await asyncio.to_thread(
             notifier.alert, key or f"human:{self.account}:{chat_id}",
-            f"闲鱼[{self.account}]有买家等你回复",
-            f"买家：{buyer_name}\n商品：{item_id}\n他说：{text}\n原因：{reason}\n这个会话的自动回复已暂停 1 小时，你回复后他的下一句机器人也不会插嘴。",
-            cooldown)
+            notice_title, notice_body, cooldown, True)
 
     # ---------- 素材文件夹：所有在售商品提前建好 ----------
     async def media_sync_loop(self):

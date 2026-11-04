@@ -381,35 +381,31 @@ class XianyuApis:
             break
         raise RuntimeError(f"{api} 失败：{last}")
 
-    # ---------- 我的在售商品（用来提前建素材文件夹） ----------
+    # ---------- 我的在售商品（用来提前建素材文件夹，也用来辅助判断是不是本号的商品） ----------
     def list_my_items(self, page_size=20, max_pages=30):
-        """当前账号主页上的商品 [{item_id, title}]，翻页取完"""
+        """当前账号主页上的商品 [{item_id, title}]，按闲鱼给的翻页标记翻完。
+
+        只传 pageNumber 时，第 2 页经常还是第一页或直接空，商品多的号会漏。
+        这里带上 nextPageModel / 分组。漏掉的不能当成「这个号不是卖家」。
+        """
         head = self.mtop('mtop.idle.web.user.page.head', {'self': True})
         uid = str((head.get('base') or head.get('baseInfo') or {}).get('kcUserId') or '').strip()
         if not uid:
             raise RuntimeError(f'无法解析当前账号 userId：{list(head.keys())}')
-        out, seen = [], set()
-        for page in range(1, max_pages + 1):
+
+        def fetch(payload):
             try:
-                data = self.mtop('mtop.idle.web.xyh.item.list', {'userId': uid, 'pageNumber': page, 'pageSize': page_size})
+                return self.mtop('mtop.idle.web.xyh.item.list', payload)
             except RuntimeError as e:
-                if page == 1:
+                if payload.get('pageNumber', 1) == 1:
                     raise
-                # 闲鱼限制能翻的页数：翻到头就用已经拿到的，下一轮再来
-                logger.warning(f"[{self.account}] 商品列表翻到第 {page} 页被限制，已取 {len(out)} 个：{e}")
-                break
-            cards = data.get('cardList') or data.get('itemList') or []
-            new = 0
-            for c in cards:
-                cd = (c or {}).get('cardData') or {}
-                iid = str(cd.get('id') or (cd.get('detailParams') or {}).get('itemId') or '')
-                if iid and iid not in seen:
-                    seen.add(iid)
-                    new += 1
-                    out.append({'item_id': iid, 'title': cd.get('title') or (cd.get('detailParams') or {}).get('title') or ''})
-            if not cards or not new or data.get('nextPage') is False:
-                break
-            time.sleep(1)
+                logger.warning(f"[{self.account}] 商品列表翻到第 {payload.get('pageNumber')} 页被限制，用已经拿到的：{e}")
+                return {'cardList': [], 'nextPage': False}
+
+        out, aliases, note = collect_item_pages(fetch, uid, page_size, max_pages, sleep_fn=lambda: time.sleep(1))
+        self.last_item_id_aliases = aliases
+        self.last_item_list_note = note
+        logger.info(f"[{self.account}] 账号商品列表：{note}")
         return out
 
     # ---------- 订单 ----------
@@ -516,3 +512,95 @@ class XianyuApis:
         if etag != hashlib.md5(raw).hexdigest():
             raise RuntimeError(f"文件上传后 ETag {etag} 和 MD5 对不上")
         return {'displayName': name, 'fileKey': key, 'fileSize': len(raw), 'fileType': ext}
+
+
+def _card_item(card):
+    """从主页卡片取出商品 id。以 detailParams.itemId 为准，卡片 id 不一样时只当别名。"""
+    cd = (card or {}).get('cardData') if isinstance(card, dict) else None
+    if not isinstance(cd, dict):
+        cd = card if isinstance(card, dict) else {}
+    detail = cd.get('detailParams') if isinstance(cd.get('detailParams'), dict) else {}
+    detail_id = str(detail.get('itemId') or '').strip()
+    card_id = str(cd.get('itemId') or cd.get('id') or '').strip()
+    canonical = detail_id or card_id
+    aliases = []
+    if card_id and canonical and card_id != canonical:
+        aliases.append(card_id)
+    title = cd.get('title') or detail.get('title') or ''
+    return canonical, title, aliases
+
+
+def _next_list_payload(data, uid, page_size, next_page_number):
+    """按上一页返回的翻页标记组下一页。没有下一页就返回 None。"""
+    if not isinstance(data, dict) or data.get('nextPage') is False:
+        return None
+    payload = {'userId': str(uid), 'pageNumber': next_page_number, 'pageSize': page_size}
+    for key in ('nextPageModel', 'nextPageNum', 'groupSortId'):
+        if data.get(key) not in (None, ''):
+            payload[key] = data.get(key)
+    groups = data.get('itemGroupList') or []
+    group = None
+    for item in groups:
+        if isinstance(item, dict) and item.get('groupName') == '综合':
+            group = item
+            break
+    if group is None:
+        for item in groups:
+            if isinstance(item, dict) and item.get('defaultGroup'):
+                group = item
+                break
+    if group:
+        if group.get('groupId') not in (None, ''):
+            payload['groupId'] = group.get('groupId')
+        if group.get('groupName'):
+            payload['groupName'] = group.get('groupName')
+        if 'defaultGroup' in group:
+            payload['defaultGroup'] = group.get('defaultGroup')
+    elif data.get('groupId') not in (None, ''):
+        payload['groupId'] = data.get('groupId')
+        if data.get('groupName'):
+            payload['groupName'] = data.get('groupName')
+    return payload
+
+
+def collect_item_pages(fetch, uid, page_size=20, max_pages=30, sleep_fn=None):
+    """翻完主页商品。返回 (商品列表, 别名 id 集合, 给人看的说明)。"""
+    out, seen, aliases = [], set(), set()
+    payload = {'needGroupInfo': True, 'userId': str(uid), 'pageNumber': 1, 'pageSize': page_size}
+    pages = 0
+    truncated = False
+    extra = []
+    for page in range(1, max_pages + 1):
+        pages = page
+        data = fetch(payload) or {}
+        cards = data.get('cardList') or data.get('itemList') or []
+        new = 0
+        for card in cards:
+            item_id, title, extra_ids = _card_item(card)
+            if item_id and item_id not in seen:
+                seen.add(item_id)
+                new += 1
+                out.append({'item_id': item_id, 'title': title})
+            for alias in extra_ids:
+                if alias not in seen:
+                    aliases.add(alias)
+                    seen.add(alias)
+        if not cards or not new or data.get('nextPage') is False:
+            break
+        nxt = _next_list_payload(data, uid, page_size, page + 1)
+        if not nxt:
+            truncated = True
+            extra.append('接口说还有下一页，但没有翻页标记')
+            break
+        payload = nxt
+        if sleep_fn:
+            sleep_fn()
+    else:
+        truncated = True
+        extra.append('到了页数上限')
+    note = f'拉到 {len(out)} 个，翻了 {pages} 页'
+    if truncated:
+        note += '，可能没翻完'
+        if extra:
+            note += '（' + '，'.join(extra) + '）'
+    return out, aliases, note
