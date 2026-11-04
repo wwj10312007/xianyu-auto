@@ -73,7 +73,7 @@ class XianyuReplyBot:
         user_assistant_msgs = [msg for msg in context if msg['role'] in ['user', 'assistant']]
         return "\n".join([f"{msg['role']}: {msg['content']}" for msg in user_assistant_msgs])
 
-    def generate_reply(self, user_msg: str, item_desc: str, context: List[Dict]) -> str:
+    def generate_reply(self, user_msg: str, item_desc: str, context: List[Dict], buyer_has_order=None) -> str:
         """生成回复主流程"""
         # 记录用户消息
         # logger.debug(f'用户所发消息: {user_msg}')
@@ -113,7 +113,8 @@ class XianyuReplyBot:
             user_msg=user_msg,
             item_desc=item_desc,
             context=formatted_context,
-            bargain_count=bargain_count
+            bargain_count=bargain_count,
+            buyer_has_order=buyer_has_order,
         )
     
     def _extract_bargain_count(self, context: List[Dict]) -> int:
@@ -173,14 +174,14 @@ class IntentRouter:
 
     def __init__(self, classify_agent):
         self.rules = {
-            'tech': {  # 技术类优先判定
-                'keywords': ['参数', '规格', '型号', '连接', '对比'],
+            'tech': {  # 周边规格优先：款式、版本，不再用音响那套「连接/参数」
+                'keywords': ['规格', '型号', '款式', '版本', '拆封', '正版', '天猫', '京东', '淘宝'],
                 'patterns': [
-                    r'和.+比'             
+                    r'和.+比'
                 ]
             },
             'price': {
-                'keywords': ['便宜', '价', '砍价', '少点'],
+                'keywords': ['便宜', '砍价', '少点', '最低', '优惠'],
                 'patterns': [r'\d+元', r'能少\d+']
             }
         }
@@ -229,23 +230,44 @@ class BaseAgent:
         self.system_prompt = system_prompt
         self.safety_filter = safety_filter
 
-    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int = 0) -> str:
+    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int = 0, buyer_has_order=None) -> str:
         """生成回复模板方法"""
-        messages = self._build_messages(user_msg, item_desc, context)
+        messages = self._build_messages(user_msg, item_desc, context, buyer_has_order)
         response = self._call_llm(messages)
         return self.safety_filter(response)
 
     HANDOFF_RULE = (
-        "\n\n【转人工】只有两种情况才输出「[转人工]」这四个字（不要输出别的内容）：买家要退款、退货、投诉、维权，"
-        "或买家明确要找老板 / 真人。其余问题（发货时间、能不能收到、库存、商品细节、价格……）都由你自己回答："
-        "按角色说明里的信息作答，不确定的细节给一个卖家口吻的稳妥回答，并引导买家下单。不要因为没把握就转人工。"
-        "\n【促成下单】每次回答完，尽量再用一句话引导买家直接拍下（如「喜欢直接拍 今天安排」「拍下就发」），"
-        "每次换着说，不重复同一句；买家在问售后或情绪不好时先解决问题再引导。"
+        "\n\n【转人工】下面任何一种，只输出「[转人工]」这四个字，不要别的内容，也不要编一个听起来稳妥的回答："
+        "买家要退款、退货、投诉、维权，或明确要找老板/真人；"
+        "或者商品信息和对话里没有依据，你拿不准、不会答、只能靠猜"
+        "（有没有抢到、哪一款、购买记录里写了什么、没写明的日期和规格）。"
+        "能确定的就按角色说明短回复，像微信聊天。不要每句都追着叫人拍下。"
+    )
+    ORDER_BOUGHT_RULE = (
+        "\n【订单状态·硬规则】买家已经拍下或已经付款。"
+        "禁止说「喜欢直接拍」「尽快下单」「拍下就好」「拍下就发」「直接拍」「赶紧拍」，以及任何催他下单的话。"
+        "只谈发货、地址、到货、售后、换货补发。"
+    )
+    ORDER_NOT_RULE = (
+        "\n【订单状态】买家还没拍下。只有合适时才引导拍下，不要每句都催。"
+    )
+    ORDER_UNKNOWN_RULE = (
+        "\n【订单状态】还没查到买家有没有拍下。不要假设；没有把握就只输出[转人工]。"
     )
 
-    def _build_messages(self, user_msg: str, item_desc: str, context: str) -> List[Dict]:
+    def _order_rule(self, buyer_has_order) -> str:
+        if buyer_has_order is True:
+            return self.ORDER_BOUGHT_RULE
+        if buyer_has_order is False:
+            return self.ORDER_NOT_RULE
+        return self.ORDER_UNKNOWN_RULE
+
+    def _build_messages(self, user_msg: str, item_desc: str, context: str, buyer_has_order=None) -> List[Dict]:
         """构建消息链"""
-        rule = "" if isinstance(self, ClassifyAgent) else self.HANDOFF_RULE
+        if isinstance(self, ClassifyAgent):
+            rule = ""
+        else:
+            rule = self.HANDOFF_RULE + self._order_rule(buyer_has_order)
         return [
             {"role": "system", "content": f"【商品信息】{item_desc}\n【你与客户对话历史】{context}\n{self.system_prompt}{rule}"},
             {"role": "user", "content": user_msg}
@@ -266,10 +288,10 @@ class BaseAgent:
 class PriceAgent(BaseAgent):
     """议价处理Agent"""
 
-    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int=0) -> str:
+    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int=0, buyer_has_order=None) -> str:
         """重写生成逻辑"""
         dynamic_temp = self._calc_temperature(bargain_count)
-        messages = self._build_messages(user_msg, item_desc, context)
+        messages = self._build_messages(user_msg, item_desc, context, buyer_has_order)
         messages[0]['content'] += f"\n▲当前议价轮次：{bargain_count}"
 
         response = self.client.chat.completions.create(
@@ -288,9 +310,9 @@ class PriceAgent(BaseAgent):
 
 class TechAgent(BaseAgent):
     """技术咨询Agent"""
-    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int=0) -> str:
+    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int=0, buyer_has_order=None) -> str:
         """重写生成逻辑"""
-        messages = self._build_messages(user_msg, item_desc, context)
+        messages = self._build_messages(user_msg, item_desc, context, buyer_has_order)
         # messages[0]['content'] += "\n▲知识库：\n" + self._fetch_tech_specs()
 
         response = self.client.chat.completions.create(

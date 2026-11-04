@@ -9,6 +9,7 @@
 import os
 import re
 import subprocess
+import tempfile
 import time
 import threading
 
@@ -52,11 +53,42 @@ def _serverchan(key, title, content, md=False):
         raise RuntimeError(f"Server酱返回：{data}")
 
 
-def send(title, content, md=False):
+def _desktop_form(title, content):
+    """转人工时弹一个可以复制文字的窗口。气泡提示字数不够，也没法复制建议回复。"""
+    if os.name != 'nt':
+        return
+    # 正文里有换行，不塞进环境变量，写到临时文件再读，避免被截断
+    handle, path = tempfile.mkstemp(prefix='xianyu_handoff_', suffix='.txt')
+    os.close(handle)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(content or '')
+    ps = (
+        "Add-Type -AssemblyName System.Windows.Forms;"
+        "Add-Type -AssemblyName System.Drawing;"
+        "[System.Media.SystemSounds]::Exclamation.Play();"
+        "$raw=[IO.File]::ReadAllText($env:XY_NF,[Text.Encoding]::UTF8);"
+        "Remove-Item -LiteralPath $env:XY_NF -ErrorAction SilentlyContinue;"
+        "$f=New-Object System.Windows.Forms.Form;"
+        "$f.Text=$env:XY_NT;$f.Width=560;$f.Height=640;$f.TopMost=$true;"
+        "$f.StartPosition='CenterScreen';"
+        "$t=New-Object System.Windows.Forms.TextBox;"
+        "$t.Multiline=$true;$t.ReadOnly=$true;$t.ScrollBars='Vertical';$t.Dock='Fill';"
+        "$t.Font=New-Object System.Drawing.Font('Microsoft YaHei',11);"
+        "$t.Text=$raw;$f.Controls.Add($t);$f.ShowDialog()|Out-Null"
+    )
+    env = dict(os.environ, XY_NT=(title or '')[:180], XY_NF=path)
+    subprocess.Popen(['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps],
+                     env=env, creationflags=0x08000000)
+
+
+def send(title, content, md=False, copyable=False):
     """马上发到所有已配置的渠道；某个渠道失败只记日志，不影响别的"""
     logger.warning(f"[通知] {title} | {content}")
     try:
-        _desktop(title, content)
+        if copyable:
+            _desktop_form(title, content)
+        else:
+            _desktop(title, content)
     except Exception as e:
         logger.error(f"桌面弹窗失败: {e!r}")
     sent = False
@@ -73,13 +105,13 @@ def send(title, content, md=False):
     return sent
 
 
-def alert(key, title, content, cooldown=3600):
-    """带冷却的通知：同一个 key 在 cooldown 秒内只发一次"""
+def alert(key, title, content, cooldown=3600, copyable=False):
+    """带冷却的通知：同一个 key 在 cooldown 秒内只发一次。copyable 时电脑上弹可复制的窗口。"""
     with _lock:
         now = time.time()
         if now - _last_sent.get(key, 0) < cooldown:
             logger.info(f"[通知] {key} 冷却中，跳过")
             return False
         _last_sent[key] = now
-    send(title, content)
+    send(title, content, copyable=copyable)
     return True
